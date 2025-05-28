@@ -30,18 +30,17 @@ void main(in VSInput  VSIn,
 {
     ObjectAttribs Obj = g_ObjectAttribs[g_ObjectConst.ObjectAttribsOffset + InstanceId];
 
-    // 1) Posición pura en mundo (rot+tras)
+    // 1) Posicion pura en mundo (rot+tras)
     float4 worldPos = mul(float4(VSIn.Pos, 1.0), Obj.ModelMat);
 
-    // 2) Rebote vertical (igual que antes)
+    // 2) Rebote vertical 
     const float yMin = 0.0;
     const float yMax = 0.2;
-float h0 = saturate((VSIn.Pos.y - yMin)/(yMax - yMin));
-float h  = h0 * h0;    // cuadrado: los vértices de arriba deforman muchísimo más
-worldPos.y += g_Constants.BounceAmp * h;
+    float h0 = saturate((VSIn.Pos.y - yMin)/(yMax - yMin));
+    float h  = h0 * h0;    // cuadrado: los vertices de arriba deforman mas
+    worldPos.y += g_Constants.BounceAmp * h;
 
-    // 3) >>> NUEVO: estirón horizontal GELATINOSO <<<
-    //    Sólo si te mueves (MoveDir ? 0) y atenuado por h:
+    //    Solo si se mueve (MoveDir ? 0) y atenuado por h:
     float2 horizontalOffset = g_Constants.MoveDir.xz * (g_Constants.FlowAmp * h);
     worldPos.xz -= horizontalOffset;
 

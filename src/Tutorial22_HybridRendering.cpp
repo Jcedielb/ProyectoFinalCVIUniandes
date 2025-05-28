@@ -163,182 +163,223 @@ Tutorial22_HybridRendering::Mesh Tutorial22_HybridRendering::CreateTexturedPlane
     return PlaneMesh;
 }
 
-void Tutorial22_HybridRendering::CreateSceneObjects(const uint2 CubeMaterialRange, const Uint32 GroundMaterial)
+// -----------------------------------------------------------------------------
+// Crea todos los objetos de la escena (cubo dinámico + plano del suelo)
+// -----------------------------------------------------------------------------
+//  • Genera y fusiona dos mallas: un cubo y un plano texturizado.
+//  • Copia todos los vértices/índices en buffers compartidos (útiles para RT).
+//  • Rellena m_Scene.Meshes, m_Scene.Objects, m_Scene.DynamicObjects, etc.
+// -----------------------------------------------------------------------------
+void Tutorial22_HybridRendering::CreateSceneObjects(const uint2  CubeMaterialRange,
+                                                    const Uint32 GroundMaterial)
 {
     Uint32 CubeMeshId  = 0;
     Uint32 PlaneMeshId = 0;
 
-    // Create meshes
+    // -------------------------------------------------------------------------
+    // 1) Crear las dos mallas (cubo + plano) y fusionar sus VB/IB en buffers
+    //    compartidos para que los BLAS puedan acceder a memoria contigua.
+    // -------------------------------------------------------------------------
     {
+        // --- CUBO -------------------------------------------------------------
         Mesh CubeMesh;
         CubeMesh.Name = "Cube";
+
         GeometryPrimitiveBuffersCreateInfo CubeBuffersCI;
         CubeBuffersCI.VertexBufferBindFlags = BIND_VERTEX_BUFFER | BIND_SHADER_RESOURCE | BIND_RAY_TRACING;
-        CubeBuffersCI.IndexBufferBindFlags  = BIND_INDEX_BUFFER | BIND_SHADER_RESOURCE | BIND_RAY_TRACING;
+        CubeBuffersCI.IndexBufferBindFlags  = BIND_INDEX_BUFFER  | BIND_SHADER_RESOURCE | BIND_RAY_TRACING;
         CubeBuffersCI.VertexBufferMode      = BUFFER_MODE_STRUCTURED;
         CubeBuffersCI.IndexBufferMode       = BUFFER_MODE_STRUCTURED;
+
         GeometryPrimitiveInfo CubeGeoInfo;
-        CreateGeometryPrimitiveBuffers(m_pDevice, CubeGeometryPrimitiveAttributes{2.f, GEOMETRY_PRIMITIVE_VERTEX_FLAG_ALL},
-                                       &CubeBuffersCI, &CubeMesh.VertexBuffer, &CubeMesh.IndexBuffer, &CubeGeoInfo);
+        CreateGeometryPrimitiveBuffers(
+            m_pDevice,
+            CubeGeometryPrimitiveAttributes{2.f, GEOMETRY_PRIMITIVE_VERTEX_FLAG_ALL},
+            &CubeBuffersCI,
+            &CubeMesh.VertexBuffer,
+            &CubeMesh.IndexBuffer,
+            &CubeGeoInfo);
+
         CubeMesh.NumVertices = CubeGeoInfo.NumVertices;
         CubeMesh.NumIndices  = CubeGeoInfo.NumIndices;
 
-        auto PlaneMesh = CreateTexturedPlaneMesh(m_pDevice, float2{25});
+        // --- PLANO -----------------------------------------------------------
+        Mesh PlaneMesh = CreateTexturedPlaneMesh(m_pDevice, float2{25.0f});
 
-        const auto RTProps = m_pDevice->GetAdapterInfo().RayTracing;
+        // --- Calcular offsets correctamente alineados ------------------------
+        const auto RTProps        = m_pDevice->GetAdapterInfo().RayTracing;
+        CubeMesh.FirstVertex      = 0;
+        CubeMesh.FirstIndex       = 0;
+        PlaneMesh.FirstVertex     = AlignUp(CubeMesh.NumVertices * Uint32{sizeof(HLSL::Vertex)},
+                                            RTProps.VertexBufferAlignment) /
+                                     sizeof(HLSL::Vertex);
+        PlaneMesh.FirstIndex      = AlignUp(CubeMesh.NumIndices * Uint32{sizeof(uint)},
+                                            RTProps.IndexBufferAlignment) /
+                                     sizeof(uint);
 
-        // Cube mesh will be copied to the beginning of the buffers
-        CubeMesh.FirstVertex = 0;
-        CubeMesh.FirstIndex  = 0;
-        // Plane mesh data will reside after the cube. Offsets must be properly aligned!
-        PlaneMesh.FirstVertex = AlignUp(CubeMesh.NumVertices * Uint32{sizeof(HLSL::Vertex)}, RTProps.VertexBufferAlignment) / sizeof(HLSL::Vertex);
-        PlaneMesh.FirstIndex  = AlignUp(CubeMesh.NumIndices * Uint32{sizeof(uint)}, RTProps.IndexBufferAlignment) / sizeof(uint);
-
-        // Merge vertex buffers
+        // --- Fusionar vertex buffers ----------------------------------------
         {
             BufferDesc VBDesc;
             VBDesc.Name              = "Shared vertex buffer";
             VBDesc.BindFlags         = BIND_VERTEX_BUFFER | BIND_SHADER_RESOURCE | BIND_RAY_TRACING;
-            VBDesc.Size              = (Uint64{PlaneMesh.FirstVertex} + Uint64{PlaneMesh.NumVertices}) * sizeof(HLSL::Vertex);
+            VBDesc.Size              = (Uint64{PlaneMesh.FirstVertex} + Uint64{PlaneMesh.NumVertices}) *
+                                       sizeof(HLSL::Vertex);
             VBDesc.Mode              = BUFFER_MODE_STRUCTURED;
             VBDesc.ElementByteStride = sizeof(HLSL::Vertex);
 
             RefCntAutoPtr<IBuffer> pSharedVB;
             m_pDevice->CreateBuffer(VBDesc, nullptr, &pSharedVB);
 
-            // Copy cube vertices
-            m_pImmediateContext->CopyBuffer(CubeMesh.VertexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
-                                            pSharedVB, CubeMesh.FirstVertex * sizeof(HLSL::Vertex), CubeMesh.NumVertices * sizeof(HLSL::Vertex),
-                                            RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+            // Copiamos cubo
+            m_pImmediateContext->CopyBuffer(
+                CubeMesh.VertexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+                pSharedVB, CubeMesh.FirstVertex * sizeof(HLSL::Vertex),
+                CubeMesh.NumVertices * sizeof(HLSL::Vertex),
+                RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
-            // Copy plane vertices
-            m_pImmediateContext->CopyBuffer(PlaneMesh.VertexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
-                                            pSharedVB, PlaneMesh.FirstVertex * sizeof(HLSL::Vertex), PlaneMesh.NumVertices * sizeof(HLSL::Vertex),
-                                            RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+            // Copiamos plano
+            m_pImmediateContext->CopyBuffer(
+                PlaneMesh.VertexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+                pSharedVB, PlaneMesh.FirstVertex * sizeof(HLSL::Vertex),
+                PlaneMesh.NumVertices * sizeof(HLSL::Vertex),
+                RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
             CubeMesh.VertexBuffer  = pSharedVB;
             PlaneMesh.VertexBuffer = pSharedVB;
         }
 
-        // Merge index buffers
+        // --- Fusionar index buffers -----------------------------------------
         {
             BufferDesc IBDesc;
             IBDesc.Name              = "Shared index buffer";
             IBDesc.BindFlags         = BIND_INDEX_BUFFER | BIND_SHADER_RESOURCE | BIND_RAY_TRACING;
-            IBDesc.Size              = (Uint64{PlaneMesh.FirstIndex} + Uint64{PlaneMesh.NumIndices}) * sizeof(uint);
+            IBDesc.Size              = (Uint64{PlaneMesh.FirstIndex} + Uint64{PlaneMesh.NumIndices}) *
+                                       sizeof(uint);
             IBDesc.Mode              = BUFFER_MODE_STRUCTURED;
             IBDesc.ElementByteStride = sizeof(uint);
 
             RefCntAutoPtr<IBuffer> pSharedIB;
             m_pDevice->CreateBuffer(IBDesc, nullptr, &pSharedIB);
 
-            // Copy cube indices
-            m_pImmediateContext->CopyBuffer(CubeMesh.IndexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
-                                            pSharedIB, CubeMesh.FirstIndex * sizeof(uint), CubeMesh.NumIndices * sizeof(uint),
-                                            RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+            // Copiamos cubo
+            m_pImmediateContext->CopyBuffer(
+                CubeMesh.IndexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+                pSharedIB, CubeMesh.FirstIndex * sizeof(uint),
+                CubeMesh.NumIndices * sizeof(uint),
+                RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
-            // Copy plane indices
-            m_pImmediateContext->CopyBuffer(PlaneMesh.IndexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
-                                            pSharedIB, PlaneMesh.FirstIndex * sizeof(uint), PlaneMesh.NumIndices * sizeof(uint),
-                                            RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+            // Copiamos plano
+            m_pImmediateContext->CopyBuffer(
+                PlaneMesh.IndexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+                pSharedIB, PlaneMesh.FirstIndex * sizeof(uint),
+                PlaneMesh.NumIndices * sizeof(uint),
+                RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
             CubeMesh.IndexBuffer  = pSharedIB;
             PlaneMesh.IndexBuffer = pSharedIB;
         }
 
-        CubeMeshId = static_cast<Uint32>(m_Scene.Meshes.size());
+        // Guardar IDs en el vector de mallas de la escena
+        CubeMeshId  = static_cast<Uint32>(m_Scene.Meshes.size());
         m_Scene.Meshes.push_back(CubeMesh);
-        PlaneMeshId = static_cast<Uint32>(m_Scene.Meshes.size());
+
         PlaneMeshId = static_cast<Uint32>(m_Scene.Meshes.size());
         m_Scene.Meshes.push_back(PlaneMesh);
     }
 
-    // Create cube objects
-    const auto AddCubeObject = [&](float Angle, float X, float Y, float Z, float Scale, bool IsDynamic = false) //
+    // -------------------------------------------------------------------------
+    // 2) Helper para añadir un cubo (estático o dinámico)
+    // -------------------------------------------------------------------------
+    const auto AddCubeObject =
+        [&](float Angle, float X, float Y, float Z, float Scale, bool IsDynamic = false)
     {
-        const auto ModelMat = float4x4::RotationY(Angle * PI_F) * float4x4::Scale(Scale) * float4x4::Translation(X * 2.0f, Y * 2.0f - 1.0f, Z * 2.0f);
+        const auto ModelMat =
+            float4x4::RotationY(Angle * PI_F) *
+            float4x4::Scale(Scale) *
+            float4x4::Translation(X * 2.0f, Y * 2.0f - 1.0f, Z * 2.0f);
 
-        HLSL::ObjectAttribs obj;
-        obj.ModelMat    = ModelMat.Transpose();
-        obj.NormalMat   = obj.ModelMat;
-        obj.MaterialId  = (m_Scene.Objects.size() % (CubeMaterialRange.y - CubeMaterialRange.x)) + CubeMaterialRange.x;
-        obj.MeshId      = CubeMeshId;
-        obj.FirstIndex  = m_Scene.Meshes[obj.MeshId].FirstIndex;
-        obj.FirstVertex = m_Scene.Meshes[obj.MeshId].FirstVertex;
-        obj.MinY        = 3.0f; // tu valor real
-        obj.MaxY        = 4.0f; // tu valor real
-        m_Scene.Objects.push_back(obj);
+        HLSL::ObjectAttribs Obj;
+        Obj.ModelMat    = ModelMat.Transpose();
+        Obj.NormalMat   = Obj.ModelMat;
+        Obj.MaterialId  = (m_Scene.Objects.size() % (CubeMaterialRange.y - CubeMaterialRange.x)) +
+                          CubeMaterialRange.x;
+        Obj.MeshId      = CubeMeshId;
+        Obj.FirstIndex  = m_Scene.Meshes[Obj.MeshId].FirstIndex;
+        Obj.FirstVertex = m_Scene.Meshes[Obj.MeshId].FirstVertex;
+        Obj.MinY        = 3.0f; // Altura mínima local->mundo (para deformaciones)
+        Obj.MaxY        = 4.0f; // Altura máxima local->mundo
+        m_Scene.Objects.push_back(Obj);
 
+        // Si es dinámico lo añadimos también a la lista de DynamicObjects
         if (IsDynamic)
         {
-            DynamicObject DynObj;
-            DynObj.ObjectAttribsIndex = static_cast<Uint32>(m_Scene.Objects.size() - 1);
+            DynamicObject Dyn;
+            Dyn.ObjectAttribsIndex = static_cast<Uint32>(m_Scene.Objects.size() - 1);
+            Dyn.Slowdown           = 0.2f + m_Scene.DynamicObjects.size() * 0.05f; // único por copia
+            Dyn.TimeAccumulator    = 0.0f;
+            Dyn.BaseModelMat       = ModelMat;
 
-            // Asigna un slowdown �nico: por ejemplo, 0.8 + 0.05 por cada din�mico ya existente
-            DynObj.Slowdown        = 0.2f + m_Scene.DynamicObjects.size() * 0.05f;
-            DynObj.TimeAccumulator = 0.0f;
-
-            DynObj.BaseModelMat = ModelMat; // la matriz antes de trasponer
-
-            m_Scene.DynamicObjects.push_back(DynObj);
+            m_Scene.DynamicObjects.push_back(Dyn);
         }
     };
-    // clang-format off
-    
-    AddCubeObject(0.f, 0.f, 0.f,  10.f, 1.1f, true);
 
-    
+    // -------------------------------------------------------------------------
+    // 3) Cubo “principal” y sus copias gelatinosas
+    // -------------------------------------------------------------------------
+    AddCubeObject(/*Angle*/ 0.f, /*X*/ 0.f, /*Y*/ 0.f, /*Z*/ 10.f,
+                  /*Scale*/ 1.1f, /*IsDynamic*/ true);
 
-
-
-        // Generar copias �gelatinosas� de cada objeto din�mico
-    // Guardar cu�ntos din�micos hab�a originalmente
+    // Generar n copias “gel” con retardos diferentes
     const size_t OrigDynCount = m_Scene.DynamicObjects.size();
     for (size_t i = 0; i < OrigDynCount; ++i)
     {
-        // �ndice y datos del objeto base
         const auto BaseIndex = m_Scene.DynamicObjects[i].ObjectAttribsIndex;
         const auto BaseObj   = m_Scene.Objects[BaseIndex];
 
-        // Para cada copia gelatina
         for (int k = 1; k <= kNumGelInstances; ++k)
         {
-            // A�adir un nuevo HLSL::ObjectAttribs id�ntico
+            // Copia de atributos
             m_Scene.Objects.push_back(BaseObj);
 
-            // Registrar en DynamicObjects con su slowdown
-            DynamicObject GelObj;
-            GelObj.ObjectAttribsIndex = static_cast<Uint32>(m_Scene.Objects.size() - 1);
-            GelObj.Slowdown           = 0.5f - k * kGelSlowdownStep; 
-            m_Scene.DynamicObjects.push_back(GelObj);
+            DynamicObject Gel;
+            Gel.ObjectAttribsIndex = static_cast<Uint32>(m_Scene.Objects.size() - 1);
+            Gel.Slowdown           = 0.5f - k * kGelSlowdownStep;
+            m_Scene.DynamicObjects.push_back(Gel);
         }
     }
 
+    // -------------------------------------------------------------------------
+    // 4) Instancing: un bloque para TODOS los cubos (mesh = cubo)
+    // -------------------------------------------------------------------------
+    InstancedObjects InstCubes;
+    InstCubes.MeshInd             = CubeMeshId;
+    InstCubes.ObjectAttribsOffset = 0;
+    InstCubes.NumObjects          = static_cast<Uint32>(m_Scene.Objects.size());
+    m_Scene.ObjectInstances.push_back(InstCubes);
 
+    // -------------------------------------------------------------------------
+    // 5) Crear plano del suelo
+    // -------------------------------------------------------------------------
+    InstancedObjects InstGround;
+    InstGround.MeshInd             = PlaneMeshId;
+    InstGround.ObjectAttribsOffset = static_cast<Uint32>(m_Scene.Objects.size());
 
-    // clang-format on
-
-    InstancedObjects InstObj;
-    InstObj.MeshInd             = CubeMeshId;
-    InstObj.NumObjects          = static_cast<Uint32>(m_Scene.Objects.size());
-    InstObj.ObjectAttribsOffset = 0;
-    m_Scene.ObjectInstances.push_back(InstObj);
-
-    // Create ground plane object
-    InstObj.ObjectAttribsOffset = static_cast<Uint32>(m_Scene.Objects.size());
-    InstObj.MeshInd             = PlaneMeshId;
     {
-        HLSL::ObjectAttribs obj;
-        obj.ModelMat    = (float4x4::Scale(50.f, 1.f, 50.f) * float4x4::Translation(0.f, -0.2f, 0.f)).Transpose();
-        obj.NormalMat   = float3x3::Identity();
-        obj.MaterialId  = GroundMaterial;
-        obj.MeshId      = PlaneMeshId;
-        obj.FirstIndex  = m_Scene.Meshes[obj.MeshId].FirstIndex;
-        obj.FirstVertex = m_Scene.Meshes[obj.MeshId].FirstVertex;
-        m_Scene.Objects.push_back(obj);
+        HLSL::ObjectAttribs Obj;
+        Obj.ModelMat    = (float4x4::Scale(50.f, 1.f, 50.f) *
+                           float4x4::Translation(0.f, -0.2f, 0.f))
+                              .Transpose();
+        Obj.NormalMat   = float3x3::Identity();
+        Obj.MaterialId  = GroundMaterial;
+        Obj.MeshId      = PlaneMeshId;
+        Obj.FirstIndex  = m_Scene.Meshes[Obj.MeshId].FirstIndex;
+        Obj.FirstVertex = m_Scene.Meshes[Obj.MeshId].FirstVertex;
+        m_Scene.Objects.push_back(Obj);
     }
-    InstObj.NumObjects = static_cast<Uint32>(m_Scene.Objects.size()) - InstObj.ObjectAttribsOffset;
-    m_Scene.ObjectInstances.push_back(InstObj);
+
+    InstGround.NumObjects = static_cast<Uint32>(m_Scene.Objects.size()) -
+                            InstGround.ObjectAttribsOffset;
+    m_Scene.ObjectInstances.push_back(InstGround);
 }
 
 void Tutorial22_HybridRendering::CreateSceneAccelStructs()
@@ -818,47 +859,64 @@ void Tutorial22_HybridRendering::CreateRayTracingPSO(IShaderSourceInputStreamFac
     }
 }
 
+// ============================================================================
+// Inicialización global del tutorial
+// ============================================================================
 void Tutorial22_HybridRendering::Initialize(const SampleInitInfo& InitInfo)
 {
+    // 0) Infra-estructura básica (ventana, dispositivo, swap-chain…)
     SampleBase::Initialize(InitInfo);
 
-
-
-    // RayTracing feature indicates that some of ray tracing functionality is supported.
-    // Acceleration structures are always supported if RayTracing feature is enabled.
-    // Inline ray tracing may be unsupported by old DirectX 12 drivers or if this feature is not supported by Vulkan.
-    if ((m_pDevice->GetAdapterInfo().RayTracing.CapFlags & RAY_TRACING_CAP_FLAG_INLINE_RAY_TRACING) == 0)
+    // 1) Comprobar que la GPU/driver soporta *inline ray tracing* (SM 6.5 / RTX / Apple GPU).
+    //    Si no es así, abortamos la demo con un mensaje claro.
+    if ((m_pDevice->GetAdapterInfo().RayTracing.CapFlags &
+         RAY_TRACING_CAP_FLAG_INLINE_RAY_TRACING) == 0)
     {
-        UNSUPPORTED("Inline ray tracing is not supported by device");
+        UNSUPPORTED("Inline ray tracing is not supported by this device / driver");
         return;
     }
 
-    // Setup camera.
-    // Nueva ubicaci�n: m�s lejos y un poco m�s baja
-    m_Camera.SetPos(float3{-20.0f, 2.0f, -12.0f});
-    // Baja el �ngulo de pitch para que mire m�s hacia arriba desde abajo
-    m_Camera.SetRotation(12.0f, -0.3f);
-    m_Camera.SetRotationSpeed(0.005f);
-    m_Camera.SetMoveSpeed(0.f);
-    m_Camera.SetSpeedUpScales(0.f, 0.f);
+    // 2) Configuración inicial de la cámara ―
+    //    Un plano más alejado y un poco bajo para apreciar mejor la deformación.
+    m_Camera.SetPos(float3{-20.0f, 2.0f, -12.0f}); // (x, y, z)
+    m_Camera.SetRotation(/*pitch*/ 12.0f, /*yaw*/ -0.3f);
+    m_Camera.SetRotationSpeed(0.005f);  // Sensibilidad del ratón
+    m_Camera.SetMoveSpeed(0.0f);        // Cámara fija; solo orbit
+    m_Camera.SetSpeedUpScales(0.0f, 0.0f);
 
+    // 3) Construir toda la escena (mallas, materiales, BLAS/TLAS…)
     CreateScene();
 
-    // Create buffer for constants that is shared between all PSOs
+    // 4) Constant Buffer global compartido por todos los PSO
     {
-        BufferDesc BuffDesc;
-        BuffDesc.Name      = "Global constants buffer";
-        BuffDesc.BindFlags = BIND_UNIFORM_BUFFER;
-        BuffDesc.Size      = sizeof(HLSL::GlobalConstants);
-        m_pDevice->CreateBuffer(BuffDesc, nullptr, &m_Constants);
+        BufferDesc CBDesc;
+        CBDesc.Name      = "Global constants buffer";
+        CBDesc.BindFlags = BIND_UNIFORM_BUFFER;
+        CBDesc.Size      = sizeof(HLSL::GlobalConstants);
+        m_pDevice->CreateBuffer(CBDesc, nullptr, &m_Constants);
     }
 
-    RefCntAutoPtr<IShaderSourceInputStreamFactory> pShaderSourceFactory;
-    m_pEngineFactory->CreateDefaultShaderSourceStreamFactory(nullptr, &pShaderSourceFactory);
+    // 5) Factoría de ficheros fuente HLSL/MSL
+    RefCntAutoPtr<IShaderSourceInputStreamFactory> pShaderFactory;
+    m_pEngineFactory->CreateDefaultShaderSourceStreamFactory(nullptr, &pShaderFactory);
 
-    CreateRasterizationPSO(pShaderSourceFactory);
-    CreatePostProcessPSO(pShaderSourceFactory);
-    CreateRayTracingPSO(pShaderSourceFactory);
+    // 6) Crear los tres PSO principales:
+    //    • Rasterización (G-Buffer)   • Ray Tracing (Compute)   • Post-Proceso
+    CreateRasterizationPSO(pShaderFactory);
+    CreatePostProcessPSO  (pShaderFactory);
+    CreateRayTracingPSO   (pShaderFactory);
+}
+
+// ============================================================================
+// Pedimos al motor que habilite explícitamente la feature de Ray Tracing
+// antes de crear el dispositivo y los contextos.
+// ============================================================================
+void Tutorial22_HybridRendering::ModifyEngineInitInfo(
+    const ModifyEngineInitInfoAttribs& Attribs)
+{
+    SampleBase::ModifyEngineInitInfo(Attribs);
+
+    Attribs.EngineCI.Features.RayTracing = DEVICE_FEATURE_STATE_ENABLED;
 }
 
 void Tutorial22_HybridRendering::ModifyEngineInitInfo(const ModifyEngineInitInfoAttribs& Attribs)
@@ -869,35 +927,30 @@ void Tutorial22_HybridRendering::ModifyEngineInitInfo(const ModifyEngineInitInfo
     Attribs.EngineCI.Features.RayTracing = DEVICE_FEATURE_STATE_ENABLED;
 }
 
+
 void Tutorial22_HybridRendering::Render()
 {
-    // Update constants
+    // ────────────────────────────────────────────────────────────────────────
+    // 1) CONSTANT BUFFER GLOBAL
+    // ----------------------------------------------------------------------
     {
-        const auto ViewProj = m_Camera.GetViewMatrix() * m_Camera.GetProjMatrix();
+        const float4x4 ViewProj    = m_Camera.GetViewMatrix() * m_Camera.GetProjMatrix();
 
-        HLSL::GlobalConstants GConst;
+        HLSL::GlobalConstants GConst = {};
         GConst.ViewProj     = ViewProj.Transpose();
         GConst.ViewProjInv  = ViewProj.Inverse().Transpose();
         GConst.LightDir     = normalize(-m_LightDir);
-        GConst.CameraPos    = float4(m_Camera.GetPos(), 0.f);
+        GConst.CameraPos    = float4{m_Camera.GetPos(), 0.0f};
         GConst.DrawMode     = m_DrawMode;
-        GConst.MaxRayLength = 100.f;
-        GConst.AmbientLight = 0.1f;
+        GConst.MaxRayLength = 100.0f;
+        GConst.AmbientLight = 0.10f;
 
-        // Rebote vertical
-        GConst.BounceAmp = m_BounceAmp;
+        // Parámetros específicos del “cubo gelatinoso”
+        GConst.BounceAmp = m_BounceAmp;                                     // amplitud rebote vertical
+        GConst.MoveDir   = float4{m_SmoothedMoveDir, 0.0f};                 // dirección suavizada
+        GConst.FlowAmp   = m_FlowAmplitude;                                 // estirón horizontal
 
-        // ** NUEVO: direcci�n de movimiento para deformar gelatinosidad horizontal **
-        // ** NUEVO: direcci�n de movimiento suavizada para deformar el gel **
-            GConst.MoveDir = float4{m_SmoothedMoveDir.x,
-                                     m_SmoothedMoveDir.y,
-                                     m_SmoothedMoveDir.z,
-                                     0.f};
-        // amplitud del estir�n horizontal
-            GConst.FlowAmp = m_FlowAmplitude;
-
-
-        // Sube todo al GPU
+        // Enviamos a GPU
         m_pImmediateContext->UpdateBuffer(
             m_Constants,
             0,
@@ -905,7 +958,7 @@ void Tutorial22_HybridRendering::Render()
             &GConst,
             RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
-        // Actualiza tambi�n el buffer de ObjectAttribs
+        // Subimos las matrices de *cada* objeto (ya deformadas) al SRV correspondiente
         m_pImmediateContext->UpdateBuffer(
             m_Scene.ObjectAttribsBuffer,
             0,
@@ -914,94 +967,122 @@ void Tutorial22_HybridRendering::Render()
             RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // 2) TLAS – rebuild/update (obligatorio después de mover vértices)
+    // ----------------------------------------------------------------------
     UpdateTLAS();
 
-    // Rasterization pass
+    // ────────────────────────────────────────────────────────────────────────
+    // 3) G-BUFFER (rasterización clásica)
+    // ----------------------------------------------------------------------
     {
-        ITextureView* RTVs[] = {
-            m_GBuffer.Color->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET),
-            m_GBuffer.Normal->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET)};
+        ITextureView* RTVs[] =
+        {
+            m_GBuffer.Color ->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET),
+            m_GBuffer.Normal->GetDefaultView(TEXTURE_VIEW_RENDER_TARGET)
+        };
         ITextureView* pDSV = m_GBuffer.Depth->GetDefaultView(TEXTURE_VIEW_DEPTH_STENCIL);
-        m_pImmediateContext->SetRenderTargets(
-            _countof(RTVs), RTVs, pDSV, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
-        const float ClearColor[4] = {};
-        m_pImmediateContext->ClearRenderTarget(RTVs[0], ClearColor, RESOURCE_STATE_TRANSITION_MODE_NONE);
-        m_pImmediateContext->ClearRenderTarget(RTVs[1], ClearColor, RESOURCE_STATE_TRANSITION_MODE_NONE);
-        m_pImmediateContext->ClearDepthStencil(pDSV, CLEAR_DEPTH_FLAG, 1.f, 0, RESOURCE_STATE_TRANSITION_MODE_NONE);
+        // Bind & clear
+        const float Clear[4] = {};
+        m_pImmediateContext->SetRenderTargets(_countof(RTVs), RTVs, pDSV,
+                                              RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+        m_pImmediateContext->ClearRenderTarget(RTVs[0], Clear, RESOURCE_STATE_TRANSITION_MODE_NONE);
+        m_pImmediateContext->ClearRenderTarget(RTVs[1], Clear, RESOURCE_STATE_TRANSITION_MODE_NONE);
+        m_pImmediateContext->ClearDepthStencil(pDSV, CLEAR_DEPTH_FLAG,
+                                               1.f, 0, RESOURCE_STATE_TRANSITION_MODE_NONE);
 
         m_pImmediateContext->SetPipelineState(m_RasterizationPSO);
         m_pImmediateContext->CommitShaderResources(
             m_RasterizationSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
-        for (auto& ObjInst : m_Scene.ObjectInstances)
+        // Un único draw por mesh, instanciando según ObjectInstances
+        for (auto& Inst : m_Scene.ObjectInstances)
         {
-            auto&        Mesh      = m_Scene.Meshes[ObjInst.MeshInd];
-            IBuffer*     VBs[]     = {Mesh.VertexBuffer};
-            const Uint64 Offsets[] = {Mesh.FirstVertex * sizeof(HLSL::Vertex)};
+            const auto& Mesh   = m_Scene.Meshes[Inst.MeshInd];
+            IBuffer*    VBs[]  = {Mesh.VertexBuffer};
+            const Uint64 Off[] = {Mesh.FirstVertex * sizeof(HLSL::Vertex)};
 
-            m_pImmediateContext->SetVertexBuffers(
-                0, _countof(VBs), VBs, Offsets,
-                RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
-                SET_VERTEX_BUFFERS_FLAG_RESET);
+            m_pImmediateContext->SetVertexBuffers(0, 1, VBs, Off,
+                                                  RESOURCE_STATE_TRANSITION_MODE_TRANSITION,
+                                                  SET_VERTEX_BUFFERS_FLAG_RESET);
             m_pImmediateContext->SetIndexBuffer(
                 Mesh.IndexBuffer, 0, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
-            MapHelper<HLSL::ObjectConstants> ObjConstants{
-                m_pImmediateContext, m_Scene.ObjectConstants, MAP_WRITE, MAP_FLAG_DISCARD};
-            ObjConstants->ObjectAttribsOffset = ObjInst.ObjectAttribsOffset;
+            // Offset en SRV de ObjectAttribs
+            {
+                MapHelper<HLSL::ObjectConstants> ObjCB{
+                    m_pImmediateContext, m_Scene.ObjectConstants, MAP_WRITE, MAP_FLAG_DISCARD};
+                ObjCB->ObjectAttribsOffset = Inst.ObjectAttribsOffset;
+            }
 
-            DrawIndexedAttribs drawAttribs;
-            drawAttribs.NumIndices         = Mesh.NumIndices;
-            drawAttribs.NumInstances       = ObjInst.NumObjects;
-            drawAttribs.FirstIndexLocation = Mesh.FirstIndex;
-            drawAttribs.IndexType          = VT_UINT32;
-            drawAttribs.Flags              = DRAW_FLAG_VERIFY_ALL;
-            m_pImmediateContext->DrawIndexed(drawAttribs);
+            DrawIndexedAttribs DI;
+            DI.NumIndices         = Mesh.NumIndices;
+            DI.NumInstances       = Inst.NumObjects;
+            DI.FirstIndexLocation = Mesh.FirstIndex;
+            DI.IndexType          = VT_UINT32;
+            DI.Flags              = DRAW_FLAG_VERIFY_ALL;
+            m_pImmediateContext->DrawIndexed(DI);
         }
     }
 
-    // Ray tracing pass
+    // ────────────────────────────────────────────────────────────────────────
+    // 4) RAY TRACING (compute shader inline)
+    // ----------------------------------------------------------------------
     {
-        DispatchComputeAttribs dispatchAttribs;
-        dispatchAttribs.MtlThreadGroupSizeX = m_BlockSize.x;
-        dispatchAttribs.MtlThreadGroupSizeY = m_BlockSize.y;
-        dispatchAttribs.MtlThreadGroupSizeZ = 1;
+        DispatchComputeAttribs DC;
+        DC.MtlThreadGroupSizeX = m_BlockSize.x;
+        DC.MtlThreadGroupSizeY = m_BlockSize.y;
+        DC.MtlThreadGroupSizeZ = 1;
 
-        const auto& TexDesc               = m_GBuffer.Color->GetDesc();
-        dispatchAttribs.ThreadGroupCountX = TexDesc.Width / m_BlockSize.x;
-        dispatchAttribs.ThreadGroupCountY = TexDesc.Height / m_BlockSize.y;
+        const auto& TexDesc = m_GBuffer.Color->GetDesc();
+        DC.ThreadGroupCountX = TexDesc.Width  / m_BlockSize.x;
+        DC.ThreadGroupCountY = TexDesc.Height / m_BlockSize.y;
 
         m_pImmediateContext->SetPipelineState(m_RayTracingPSO);
         m_pImmediateContext->CommitShaderResources(
-            m_RayTracingSceneSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+            m_RayTracingSceneSRB,  RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
         m_pImmediateContext->CommitShaderResources(
             m_RayTracingScreenSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
-        m_pImmediateContext->DispatchCompute(dispatchAttribs);
+        m_pImmediateContext->DispatchCompute(DC);
     }
 
-    // Post process pass
+    // ────────────────────────────────────────────────────────────────────────
+    // 5) POST-PROCESO (full-screen triangle a back-buffer)
+    // ----------------------------------------------------------------------
     {
-        auto*       pRTV          = m_pSwapChain->GetCurrentBackBufferRTV();
-        const float ClearColor[4] = {};
+        auto* pRTV = m_pSwapChain->GetCurrentBackBufferRTV();
+        const float Clear[4] = {};
         m_pImmediateContext->SetRenderTargets(
             1, &pRTV, nullptr, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
         m_pImmediateContext->ClearRenderTarget(
-            pRTV, ClearColor, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
+            pRTV, Clear, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
         m_pImmediateContext->SetPipelineState(m_PostProcessPSO);
         m_pImmediateContext->CommitShaderResources(
             m_PostProcessSRB, RESOURCE_STATE_TRANSITION_MODE_TRANSITION);
 
         m_pImmediateContext->SetVertexBuffers(
-            0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE, SET_VERTEX_BUFFERS_FLAG_RESET);
+            0, 0, nullptr, nullptr, RESOURCE_STATE_TRANSITION_MODE_NONE,
+            SET_VERTEX_BUFFERS_FLAG_RESET);
         m_pImmediateContext->SetIndexBuffer(
             nullptr, 0, RESOURCE_STATE_TRANSITION_MODE_NONE);
 
+        // Full-screen triangle (3 vértices, sin índice)
         m_pImmediateContext->Draw(DrawAttribs{3, DRAW_FLAG_VERIFY_ALL});
     }
 }
 
+// ============================================================================
+//  Update()
+//  ────────
+//  • Integra entrada y física básica (W-A-S-D + salto + rebote).  
+//  • Calcula la dirección de movimiento suavizada para el efecto gel.  
+//  • Actualiza la cámara y mantiene sus límites.  
+//  • Genera las matrices finales (rebote + squash + desintegración) de todos
+//    los objetos dinámicos y las escribe en el vector CPU-side
+//    `m_Scene.Objects`, listo para que Render() las suba al GPU.
+// ============================================================================
 void Tutorial22_HybridRendering::Update(double CurrTime, double ElapsedTime)
 {
     SampleBase::Update(CurrTime, ElapsedTime);
@@ -1009,110 +1090,122 @@ void Tutorial22_HybridRendering::Update(double CurrTime, double ElapsedTime)
 
     const float dt = static_cast<float>(ElapsedTime);
 
-    // --- Movimiento y salto (igual que antes) ---
-    bool forward  = (GetAsyncKeyState('W') & 0x8000) != 0;
-    bool backward = (GetAsyncKeyState('S') & 0x8000) != 0;
-    bool left     = (GetAsyncKeyState('A') & 0x8000) != 0;
-    bool right    = (GetAsyncKeyState('D') & 0x8000) != 0;
+    // ────────────────────────────────────────────────────────────────────────
+    // 1) MOVIMIENTO DEL “PLAYER”  (W-A-S-D + salto)                         
+    // ----------------------------------------------------------------------
+    const bool w = (GetAsyncKeyState('W') & 0x8000) != 0;
+    const bool s = (GetAsyncKeyState('S') & 0x8000) != 0;
+    const bool a = (GetAsyncKeyState('A') & 0x8000) != 0;
+    const bool d = (GetAsyncKeyState('D') & 0x8000) != 0;
 
-    if (left) m_PlayerYaw += m_PlayerTurnSpeed * dt;
-    if (right) m_PlayerYaw -= m_PlayerTurnSpeed * dt;
+    if (a) m_PlayerYaw += m_PlayerTurnSpeed * dt;
+    if (d) m_PlayerYaw -= m_PlayerTurnSpeed * dt;
 
-    float3 forwardDir{std::sin(m_PlayerYaw), 0.f, std::cos(m_PlayerYaw)};
-    if (forward) m_PlayerPosition += forwardDir * m_PlayerMoveSpeed * dt;
-    if (backward) m_PlayerPosition -= forwardDir * m_PlayerMoveSpeed * dt;
+    const float3 forwardDir{std::sin(m_PlayerYaw), 0.0f, std::cos(m_PlayerYaw)};
+    if (w) m_PlayerPosition += forwardDir * m_PlayerMoveSpeed * dt;
+    if (s) m_PlayerPosition -= forwardDir * m_PlayerMoveSpeed * dt;
 
-    bool spaceDown = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
-    if (spaceDown && m_PlayerVelocityY == 0.0f && m_PlayerPosition.y <= m_GroundHeight + 0.001f)
+    // salto
+    const bool space = (GetAsyncKeyState(VK_SPACE) & 0x8000) != 0;
+    if (space && m_PlayerVelocityY == 0.0f && m_PlayerPosition.y <= m_GroundHeight + 0.001f)
         m_PlayerVelocityY = m_JumpImpulse;
 
-    m_PlayerVelocityY -= m_Gravity * dt;
-    m_PlayerPosition.y += m_PlayerVelocityY * dt;
+    // integra gravedad
+    m_PlayerVelocityY   -= m_Gravity * dt;
+    m_PlayerPosition.y  += m_PlayerVelocityY * dt;
 
-    // Si cae al suelo, aplicamos rebote
+    // rebote al tocar suelo
     if (m_PlayerPosition.y < m_GroundHeight)
     {
         m_PlayerPosition.y = m_GroundHeight;
-        m_PlayerVelocityY  = -m_PlayerVelocityY * m_BounceDamping;
-        if ((m_PlayerVelocityY) < 0.1f) // Si la velocidad del rebote es muy peque�a, detener el rebote
-        {
+        m_PlayerVelocityY  = -m_PlayerVelocityY * m_BounceDamping; // rebote amortiguado
+        if (std::abs(m_PlayerVelocityY) < 0.1f)                    // detén rebotes minúsculos
             m_PlayerVelocityY = 0.0f;
-        }
     }
 
-    // --- C�lculo del movimiento gelatinoso ---
-    float3 delta     = m_PlayerPosition - m_PlayerPreviousPosition;
-    float2 deltaXZ   = {delta.x, delta.z};
-    float3 moveDir3D = float3{0, 0, 1};
+    // ────────────────────────────────────────────────────────────────────────
+    // 2) DIRECCIÓN DE MOVIMIENTO PARA EFECTO “GEL”                           
+    // ----------------------------------------------------------------------
+    const float3 delta     = m_PlayerPosition - m_PlayerPreviousPosition;
+    const float2 deltaXZ   = {delta.x, delta.z};
+
+    float3 moveDir3D = m_MoveDir;           // valor anterior por si no nos movemos
     if (length(deltaXZ) > 1e-4f)
-        moveDir3D = normalize(float3{delta.x, 0.f, delta.z});
+        moveDir3D = normalize(float3{delta.x, 0.0f, delta.z});
 
     m_MoveDir                = moveDir3D;
     m_PlayerPreviousPosition = m_PlayerPosition;
-    float blend              = 1.f - std::exp(-m_MoveSmoothSpeed * dt);
+
+    // suavizado exponencial
+    const float blend        = 1.0f - std::exp(-m_MoveSmoothSpeed * dt);
     m_SmoothedMoveDir        = normalize(lerp(m_SmoothedMoveDir, moveDir3D, blend));
 
-    // --- Propagamos la nueva matriz base a todos los DynamicObject ---
-    float4x4 newBaseMat = float4x4::RotationY(m_PlayerYaw) *
-        float4x4::Translation(m_PlayerPosition);
+    // ────────────────────────────────────────────────────────────────────────
+    // 3) MATRIZ BASE PARA TODOS LOS OBJETOS DINÁMICOS                        
+    // ----------------------------------------------------------------------
+    const float4x4 newBaseMat = float4x4::RotationY(m_PlayerYaw) *
+                                float4x4::Translation(m_PlayerPosition);
     for (auto& dyn : m_Scene.DynamicObjects)
         dyn.BaseModelMat = newBaseMat;
 
-    // --- Actualiza c�mara y l�mites (igual que antes) ---
+    // ────────────────────────────────────────────────────────────────────────
+    // 4) CÁMARA (mantener dentro de límites)                                 
+    // ----------------------------------------------------------------------
     m_Camera.Update(m_InputController, dt);
     {
-        float3       Pos = m_Camera.GetPos();
-        const float3 mn  = {-20.f, 0.1f, -20.f};
-        const float3 mx  = {+20.f, +20.f, 20.f};
-        Pos              = clamp(Pos, mn, mx);
-        m_Camera.SetPos(Pos);
-        m_Camera.Update(m_InputController, 0);
+        float3 pos = m_Camera.GetPos();
+        const float3 mn{-20.f, 0.1f, -20.f};
+        const float3 mx{+20.f, +20.f,  20.f};
+        pos = clamp(pos, mn, mx);
+        m_Camera.SetPos(pos);
+        m_Camera.Update(m_InputController, 0); // sólo recalcula matrices
     }
 
-    // --- Rebote "vertical" + deformaci�n "gelatinoso" ---
-    for (auto& DynObj : m_Scene.DynamicObjects)
+    // ────────────────────────────────────────────────────────────────────────
+    // 5) DINÁMICOS: rebote, squash, desintegración                           
+    // ----------------------------------------------------------------------
+    for (auto& dyn : m_Scene.DynamicObjects)
     {
-        DynObj.TimeAccumulator += dt;
+        // 5.1  Rebote (senoidal en Y)
+        dyn.TimeAccumulator += dt;
+        const float phase = 2.0f * PI_F * m_BounceFreq * dyn.TimeAccumulator;
+        const float yOff  = m_BounceAmp * std::sin(phase);
+        const float4x4 bounce = float4x4::Translation(0.0f, yOff, 0.0f);
 
-        const float phase       = 2.f * PI_F * m_BounceFreq * DynObj.TimeAccumulator;
-        const float yOff        = m_BounceAmp * std::sin(phase);
-        float4x4    bounceXform = float4x4::Translation(0.f, yOff, 0.f);
+        // 5.2  Squash / stretch (por aterrizaje)
+        const float squashY  = 1.0f - m_LandingSquash;
+        const float squashXZ = 1.0f + m_LandingSquash * 0.5f;
+        const float4x4 squash = float4x4::Scale(squashXZ, squashY, squashXZ);
 
-        // Squash XZ/Y al aterrizar
-        float    squashY     = 1.0f - m_LandingSquash;
-        float    squashXZ    = 1.0f + m_LandingSquash * 0.5f;
-        float4x4 squashXform = float4x4::Scale(squashXZ, squashY, squashXZ);
+        // 5.3  Matriz combinada
+        float4x4 model = bounce * squash * dyn.BaseModelMat;
 
-        // Combinamos squash, rebote y la matriz base
-        float4x4 mat         = bounceXform * squashXform * DynObj.BaseModelMat;
-        float4x4 newModelMat = mat.Transpose();
-
-        m_LandingSquash = std::max(0.f, m_LandingSquash - m_SquashRecoverySpeed * dt);
-
-        // Si la desintegraci�n est� activada, comenzamos a modificar la matriz
+        // 5.4  Desintegración (si se ha activado via UI)
         if (m_Desintegrating)
         {
-            // Aumentamos el tiempo transcurrido desde el inicio de la desintegraci�n
             m_ElapsedTimeSinceDesintegration += dt;
-
-            // Modificamos la matriz de los objetos con el tiempo (en este caso, dispersamos los objetos)
-            float    dispersionFactor    = std::min(1.0f, m_ElapsedTimeSinceDesintegration * m_DesintegrationSpeed);
-            float4x4 desintegrationXform = float4x4::Scale(1.0f - dispersionFactor, 1.0f - dispersionFactor, 1.0f - dispersionFactor);
-            newModelMat                  = desintegrationXform * newModelMat; // Aplica la transformaci�n de desintegraci�n
+            const float t = std::min(1.0f, m_ElapsedTimeSinceDesintegration * m_DesintegrationSpeed);
+            const float4x4 dis = float4x4::Scale(1.0f - t, 1.0f - t, 1.0f - t);
+            model = dis * model;
         }
 
-        auto& Obj     = m_Scene.Objects[DynObj.ObjectAttribsIndex];
-        Obj.ModelMat  = newModelMat;
-        Obj.NormalMat = float4x3{newModelMat};
+        // 5.5  Escribe resultado en el array CPU-side
+        auto& Obj = m_Scene.Objects[dyn.ObjectAttribsIndex];
+        Obj.ModelMat  = model.Transpose();
+        Obj.NormalMat = float4x3{Obj.ModelMat};
     }
 
-    // --- Finalizaci�n de la desintegraci�n ---
-    if (m_ElapsedTimeSinceDesintegration > 3.0f) // 3 segundos de desintegraci�n
+    // 5.6  recupera squash poco a poco
+    m_LandingSquash = std::max(0.0f, m_LandingSquash - m_SquashRecoverySpeed * dt);
+
+    // 5.7  Fin de desintegración tras 3 s
+    if (m_ElapsedTimeSinceDesintegration > 3.0f)
     {
-        m_Desintegrating                 = false; // Detenemos la desintegraci�n despu�s de 3 segundos
-        m_ElapsedTimeSinceDesintegration = 0.0f;  // Reset del tiempo
+        m_Desintegrating                 = false;
+        m_ElapsedTimeSinceDesintegration = 0.0f;
     }
 }
+
 
 void Tutorial22_HybridRendering::WindowResize(Uint32 Width, Uint32 Height)
 {
@@ -1204,7 +1297,7 @@ void Tutorial22_HybridRendering::UpdateUI()
         // Nuevo: Control de la gravedad
         ImGui::SliderFloat("Gravity", &m_Gravity, 0.0f, 10.0f, "%.2f");
 
-        // Nuevo: Control de la direcci�n del movimiento
+        // Nuevo: Control de la direcci�n del movimiento
         if (ImGui::SliderFloat("Move Direction X", &m_MoveDir.x, -1.0f, 1.0f, "%.2f"))
         {
             m_MoveDir = normalize(m_MoveDir);
@@ -1217,13 +1310,13 @@ void Tutorial22_HybridRendering::UpdateUI()
         // Control para el "squash" al aterrizar
         ImGui::SliderFloat("Squash Recovery Speed", &m_SquashRecoverySpeed, 0.0f, 10.0f, "%.2f");
 
-        // Control para el "Landing Squash" (cu�nto se aplasta al aterrizar)
+        // Control para el "Landing Squash" (cuanto se aplasta al aterrizar)
         ImGui::SliderFloat("Landing Squash", &m_LandingSquash, 0.0f, 1.0f, "%.2f");
 
-        // Control para la suavizaci�n de la direcci�n de movimiento
+        // Control para la suavizacion de la direccion de movimiento
         ImGui::SliderFloat("Movement Direction Smoothness", &m_MoveSmoothSpeed, 0.0f, 10.0f, "%.2f");
 
-        // Nuevo: Control de la direcci�n de la c�mara
+        // Nuevo: Control de la direccion de la camara
         if (ImGui::gizmo3D("##LightDirection", m_LightDir))
         {
             if (m_LightDir.y > -0.06f)
@@ -1236,7 +1329,7 @@ void Tutorial22_HybridRendering::UpdateUI()
                 if (ImGui::Button("Desintegrar Cubo"))
         {
             m_Desintegrating                 = true;
-            m_ElapsedTimeSinceDesintegration = 0.0f; // Reinicia el tiempo de desintegraci�n
+            m_ElapsedTimeSinceDesintegration = 0.0f; // Reinicia el tiempo de desintegracion
         }
     }
     ImGui::End();

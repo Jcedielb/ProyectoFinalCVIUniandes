@@ -1,186 +1,88 @@
-# Tutorial 22 - Hybrid Rendering
+## Entrega final – Tutorial 22 · Hybrid Rendering → “Gelatinous Cube”
 
-This tutorial demonstrates how to implement a simple hybrid renderer that combines rasterization with ray tracing.
+> **Objetivo y motivación**
+> Partiendo del *Tutorial 22 – Hybrid Rendering* (raster + ray-tracing) se persigue crear una demo interactiva donde un cubo “gelatinoso” reaccione físicamente al movimiento, los saltos y los impactos con el suelo, conserve reflejos y sombras coherentes y, opcionalmente, pueda “desintegrarse” pieza a pieza.
+> La práctica ilustra cómo extender un ejemplo puramente gráfico hacia un *game-play loop* sencillo, añadir deformaciones procedurales en HLSL/GLSL y exponer los parámetros en tiempo real mediante ImGui.
 
-![](Animation_Large.gif)
+---
 
-Ray tacing is very useful for creating high-quality effects that are difficult to do with rasterization (e.g. reflections),
-but its performance is generally much lower. This tutorial demonstrates a simple hybrid rendering approach,
-where the scene is first rendered into the G-buffer with rasterization, and then ray-tracing is used to compute
-reflections and shadows. The rendering process consists of three stages:
+### 1. Código de base
 
-- G-buffer pass: a simple G-buffer that contains color, normals, and depth is rendered. 
-- Ray tracing from compute shader: reflections and shadows are computed. 
-- Post processing: results of the first two stages are combined into a shaded scene.
+| componente original                                                 | LOC aprox. | comentario                                   |
+| ------------------------------------------------------------------- | ---------: | -------------------------------------------- |
+| `Tutorial22_HybridRendering.cpp/.hpp`                               |      2 940 | motor de escena, BLAS/TLAS, PSO’s originales |
+| Shaders `Rasterization.vsh/.psh`, `RayTracing.csh`, `PostProcess.*` |        420 | G-buffer, reflexión y sombra                 |
 
-This tutorial runs in Vulkan, DirectX12 and Metal (on compatible hardware).
 
-## Scene Description
+---
 
-Ray tracing shaders need to have access to the entire scene, since, unlike rasterization, it is unknown ahead of time which 
-object a ray will hit. To achieve this, we use bindless mode, where all required textures, buffers, samplers and other
-resources are bound once and can be dynamically indexed by any draw call. In this tutorial, we use a single vertex and index
-buffer that store multiple meshes, but a real application may use buffer arrays for multiple index and vertex buffers.
+### 2. Extensión sobre el código de base
 
-Each scene objects is described by the following structure:
+| **área**                            | **archivo(s)**                   | **LOC añadidas** | **qué se hizo**                                                                                                                                                  |
+| ----------------------------------- | -------------------------------- | ---------------: | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Física básica y control             | `Tutorial22_HybridRendering.cpp` |             +510 | • Integración de gravedad, salto, rebote con amortiguación <br>• Movimiento WASD + rotación sobre *Yaw*                                                          |
+| Deformación “gel” vertical          | `Rasterization.vsh`              |              +24 | Escala Y dependiente de `g_Constants.BounceAmp` y altura del vértice                                                                                             |
+| **Shear** según dirección de marcha | `Rasterization.vsh`              |              +18 | Traslación XZ proporcional a `MoveDir` y `FlowAmp` *(non-uniform index safe)*                                                                                    |
+| Rebote procedural multi-instancia   | idem + `Update()`                |              +95 | 1 objeto dinámico  ➜ 10 sub-instancias con *slow-motion* escalonado                                                                                              |
+| Squash & Stretch al aterrizar       | `Update()`                       |              +60 | Compresión Y + expansión XZ, recuperación exponencial                                                                                                            |
+| Rebotes múltiples tipo pelota       | `Update()`                       |              +25 | Coef. `m_BounceDamping` con umbral de corte                                                                                                                      |
+| **UI – Controles runtime**          | `UpdateUI()`                     |              +40 | Sliders: *Gel Strength*, *Gravity*, *Bounce Damping*, *Flow* <br>Botón **“Desintegrar cubo”**                                                                    |
+| Desintegración progresiva           | `Update()`, `UpdateUI()`         |             +110 | • Flag `m_Desintegrating` <br>• Cronómetro `m_DesintegrationTime` <br>• Vector `m_PartDesintegrationProgress` <br>• Distribución radial de restos hacia el suelo |
+| Sombreado/Reflexión coherente       | `RayTracing.csh`                 |              +27 | Desplazamiento vertical de sombra y reflexión usando  la misma deformación que en el VS                                                                          |
+| Const-buffer ampliado               | `Structures.fxh`                 |               +6 | `BounceAmp`, `FlowAmp`, `MoveDir (float4)`                                                                                                                       |
+| Nuevas variables hpp                | `Tutorial22_HybridRendering.hpp` |              +22 | Movimiento suavizado, squash, rebote, flags de desintegración & UI                                                                                               |
 
-```cpp
-struct ObjectAttribs
-{
-    float4x4 ModelMat;
-    float4x3 NormalMat;
+**Incremento total:** **≈ 930 líneas** (+31 % sobre el tutorial original).
 
-    uint MaterialId;
-    uint FirstIndex;
-    uint FirstVertex;
-    uint MeshId; 
-};
+---
+
+### 3. Arquitectura extendida
+
+```
+┌─ Renderer (render loop)
+│   ├─ Update()
+│   │   ├─ Física & Input
+│   │   ├─ Lógica “Gel”  (bounce, shear, squash)
+│   │   └─ Desintegración   ← NUEVO
+│   ├─ UpdateTLAS()
+│   ├─ Raster pass
+│   ├─ Ray-Tracing pass
+│   └─ Post-Process
+├─ Constant Buffers
+│   └─ GlobalConstants{ BounceAmp, FlowAmp, MoveDir, … } ← ampliado
+└─ ImGui UI
+    ├─ sliders de parámetros
+    └─ botón “Desintegrar”
 ```
 
-`ModelMat` and `NormalMat` are local-to-world transformations for object positions and normals. `MaterialId` indicates the object material.
-`FirstIndex` and `FirstVertex` specify the position of the first index and first vertex in the index and vertex buffers correspondingly.
-`MeshId` is currently unused, but may indicate e.g. an index in the vertex buffer array.
+*No se añadieron nuevas clases; la lógica reside en el `Tutorial22_HybridRendering` original para mantener la simplicidad.*
 
-For ray tracing, each mesh needs a bottom-level acceleration structure (BLAS). Note that in some cases, it may better to merge all static meshes 
-into a single BLAS, which may improve ray tracing performance and speed up top-level AS construction.
+---
 
-```cpp
-struct Mesh
-{
-    RefCntAutoPtr<IBottomLevelAS> BLAS;
-    RefCntAutoPtr<IBuffer>        VertexBuffer;
-    RefCntAutoPtr<IBuffer>        IndexBuffer;
-    ...
-};
-```
+### 4. Shaders modificados / nuevos
 
-BLAS and TLAS construction is performed
-[similar to previous tutorial](https://github.com/DiligentGraphics/DiligentSamples/tree/master/Tutorials/Tutorial21_RayTracing#acceleration-structures).
+| shader                              | cambios clave                                                                                                         |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| **`Rasterization.vsh`**             | • desplazamiento Y por rebote <br>• shear XZ = `-MoveDir * FlowAmp * h` (h = altura relativa)                         |
+| **`RayTracing.csh`**                | • uso de la misma fórmula de rebote para ajustar origen de rayos de sombra/reflexión <br>• atenuación según `FlowAmp` |
+| `PostProcess.psh/vsh`               | sin cambios funcionales                                                                                               |
 
-To decrease the number of draw calls, objects with the same mesh are drawn using instancing.
+---
 
-```cpp
-struct InstancedObjects
-{
-    Uint32 MeshInd             = 0;
-    Uint32 ObjectAttribsOffset = 0;
-    Uint32 NumObjects          = 0;
-};
-```
+### 5. Resultados
 
-Note that when we access a resource by index in the shader, we need to use `NonUniformResourceIndex()` qualifier, since
-otherwise the compiler may assume that this index is constant during the draw call and may apply optimizations
-that will result in an undefined behaviour:
+<img width="1064" alt="image" src="https://github.com/user-attachments/assets/d2b5fefb-0d5d-43f1-aaca-b4724153d3d8" />
 
-```cpp
-void main(in  PSInput  PSIn,
-          out PSOutput PSOut)
-{
-    MaterialAttribs Mtr = g_MaterialAttribs[NonUniformResourceIndex(PSIn.MatId)];
+Un cubo que:
 
-    PSOut.Color =
-        Mtr.BaseColorMask * g_Textures[NonUniformResourceIndex(Mtr.BaseColorTexInd)].
-                            Sample(g_Samplers[NonUniformResourceIndex(Mtr.SampInd)], PSIn.UV);
-    PSOut.Norm  = float4(normalize(PSIn.Norm), 0.0);
-}
-```
+1. Se desplaza con WASD, deformándose más arriba que abajo.
+2. Al saltar (barra spacio) rebota varias veces, con *squash & stretch* visible.
+3. Reflejos y sombras siguen la deformación.
+4. Deslizador **Flow Amp** controla cuánta “gelatinosidad” horizontal se aplica.
+5. Botón **Desintegrar Cubo** provoca que el cubo se fragmente.
 
-## Metal ray tracing
+---
 
-All shaders are written in HLSL and can be used by DirectX12 and Vulkan backends directly. For compatibility with Metal and MSL, we 
-use [a wrapper](assets/RayQueryMtl.fxh) on top of Metal `raytracing::intersector<...>` that emulates the `RayQuery` functionality.
-The wrapper supports a minimal set of functions that are needed in this tutorial. In particular, there is no support for non-opaque objects
-that require iterating through multiple intersections. Note that instead of using a builtin `RayQuery::CommittedObjectToWorld4x3()`, as in the previous
-tutorial, we use matrices from `ObjectAttribs`.
-
-`RayQuery` wrapper can be further extended to use e.g. `TLASInstancesBuffer`, for example:
-
-```cpp
-const device MTLAccelerationStructureInstanceDescriptor* g_TLASInstances [[buffer(0)]]
-...
-// in RayQuery structure
-uint     CommittedInstanceIndex()                       { return g_TLASInstances[m_LastIntersection.instance_id].accelerationStructureIndex; }
-uint     CommittedInstanceContributionToHitGroupIndex() { return g_TLASInstances[m_LastIntersection.instance_id].intersectionFunctionTableOffset; }
-float4x3 CommittedObjectToWorld4x3()                    { return g_TLASInstances[m_LastIntersection.instance_id].transformationMatrix; }
-```
-
-## Shader Resource Declaration
-
-While rasterization shaders can be cross-compiled by Diligent Engine from HLSL to MSL, ray tracing shaders require a bit more
-care. It is currently not possible to use verbatim HLSL for ray tracing. While HLSL is generally very similar to MSL, and
-core logic will work in both languages, resource declaration differs. We use macros to hide the differences, e.g.:
-
-```cpp
-#ifdef METAL
-#    define TextureSample(Texture, Sampler, f2Coord, fLevel) Texture.sample(Sampler, f2Coord, level(fLevel))
-#    define TextureLoad(Texture, u2Coord)                    Texture.read(u2Coord)
-// ...
-
-#    define TEXTURE(Name)       const texture2d<float> Name
-#    define BUFFER(Name, Type)  const device Type*     Name
-// ...
-#else
-#    define TextureSample(Texture, Sampler, f2Coord, fLevel) Texture.SampleLevel(Sampler, f2Coord, fLevel)
-#    define TextureLoad(Texture, u2Coord)                    Texture.Load(int3(u2Coord, 0))
-// ...
-
-#    define TEXTURE(Name)        Texture2D<float4>      Name
-#    define BUFFER(Name, Type)   StructuredBuffer<Type> Name
-// ...
-#endif
-```
-
-This tutorial only defines the required macros, but a real application may follow this idea to add more functionality.
-
-Shader function declaration requires a bit more macros trickery as in HLSL, shader resources are defined as global variables,
-while in MSL, all resources are inputs to the shader function:
-
-```cpp
-BEGIN_SHADER_DECLARATION(CSMain)
-
-    // m_pRayTracingSceneResourcesSign
-    RaytracingAccelerationStructure g_TLAS                              MTL_BINDING(buffer,  0)  END_ARG
-    CONSTANT_BUFFER(                g_Constants,       GlobalConstants) MTL_BINDING(buffer,  1)  END_ARG
-    // ...
-
-    // m_pRayTracingScreenResourcesSign
-    WTEXTURE(                       g_RayTracedTex)                     MTL_BINDING(texture, 5)  END_ARG
-    TEXTURE(                        g_GBuffer_Normal)                   MTL_BINDING(texture, 6)  END_ARG
-    // ...
-   
-END_SHADER_DECLARATION(CSMain, 8, 8)
-{
-    // Shader body
-}
-```
-
-Please take a look at [RayTracing.csh](assets/RayTracing.csh) for more details.
-
-This tutorial uses explicit pipeline resource signatures to split resources of a ray-tracing pipeline into two groups:
-scene resources (`m_pRayTracingSceneResourcesSign`) and resources that depend on the window size (`m_pRayTracingScreenResourcesSign`).
-While in DirectX12 and Vulkan, the engine can perform required shader bindig remappings automatically under the hood, it is not currently
-possible in Metal backend. As a result, an application must explicitly define bindings that match the signature
-(using the `MTL_BINDING` macro in this example).
-
-
-## Ray Tracing
-
-The ray tracing shader performs the following steps:
-
-- Reconstructs the world space position from the screen-space position and depth.
-- Casts a shadow ray in the light direction using the `CastShadow(...)` function.
-  The function searches for any intersection and returns 0 if the intersection is found, and 1 otherwise.
-- Casts another ray in the reflection direction using the `Reflection(...)` function. This function
-  finds the closest intersection with the scene, applies material and calculates lighting by casting a
-  secondary shadow ray.
-- Writes the result to the output texture: reflection color is stored in the rgb components, and lighting
-  information is stored in the alpha component.
-
-## Post-Processing
-
-Post-processing is the final stage of the rendering process that does the following:
-
-- Loads the G-buffer data (color, normal and depth) and reconstructs the world-space position.
-- Loads the ray-tracing data.
-- Computes the [Fresnel term](https://en.wikipedia.org/wiki/Schlick%27s_approximation) using the view 
-  direction and surface normal and uses it to combine the reflection with the shaded pixel.
+> **Créditos**
+> Basado en el código de ejemplo de Diligent Graphics LLC (Apache-2.0).
+> Extensiones implementadas por *Juan Jose Cediel / CVI*, 2025.
